@@ -10,7 +10,7 @@ from telegram.ext import (
     Application, InlineQueryHandler, ContextTypes
 )
 
-TOKEN = os.environ["8766182774:AAGX0EslRIJ2h1sxCQbnFAmjmmdynKcAhAQ"]
+TOKEN = os.environ["BOT_TOKEN"]
 BASE_URL = os.environ["BASE_URL"].rstrip("/")
 
 ROOT = Path(__file__).parent
