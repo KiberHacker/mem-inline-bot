@@ -11,24 +11,23 @@ from PIL import Image, ImageDraw, ImageFont
 from telegram import Update, InlineQueryResultPhoto
 from telegram.ext import (
     Application,
-    InlineQueryHandler,
     CommandHandler,
+    InlineQueryHandler,
     ContextTypes,
 )
 
-# Logging
+# LOG SETTINGS
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
     level=logging.INFO,
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("MemeBot")
 
-# Environment variables
+# RENDER ENVIRONMENT
 TOKEN = os.environ["BOT_TOKEN"]
 BASE_URL = os.environ["BASE_URL"].rstrip("/")
 
-# Folders
 ROOT = Path(__file__).parent
 TEMPLATES = ROOT / "templates"
 OUTPUT = Path("/tmp/meme-output")
@@ -38,7 +37,6 @@ OUTPUT.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
-# Web server
 web = Flask(__name__)
 
 
@@ -52,27 +50,31 @@ def get_image(filename):
     if not filename.endswith(".png") or Path(filename).name != filename:
         abort(404)
 
-    if not (OUTPUT / filename).is_file():
+    path = OUTPUT / filename
+    if not path.is_file():
         abort(404)
 
     return send_from_directory(OUTPUT, filename)
 
 
-# /start command
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    await update.message.reply_text(
-        "Salom! 👋 Meme bot ishlayapti!\n\n"
-        "Mem yaratish uchun istalgan Telegram chatida:\n"
-        "@denismembot salom\n\n"
-        "deb yozing va chiqqan memlardan birini tanlang."
-    )
+# START COMMAND
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message:
+        await update.message.reply_text(
+            "Salom! 👋 Meme bot ishlayapti!\n\n"
+            "Istalgan chatda quyidagicha yozing:\n"
+            "@denismembot salom\n\n"
+            "So'ng chiqqan memlardan birini tanlang."
+        )
 
 
+# CREATE MEME IMAGE
 def make_meme(source, text):
-    image = Image.open(source).convert("RGB")
+    logger.info("Rasm ochilmoqda: %s", source.name)
+
+    with Image.open(source) as original:
+        image = original.convert("RGB")
+
     draw = ImageDraw.Draw(image)
 
     font_path = (
@@ -85,7 +87,7 @@ def make_meme(source, text):
     except OSError:
         font = ImageFont.load_default()
 
-    # Wrap text
+    # Matnni qatorlarga ajratish
     lines = []
     current = ""
 
@@ -130,36 +132,61 @@ def make_meme(source, text):
         y += line_height
 
     filename = f"{uuid.uuid4().hex}.png"
-    image.save(OUTPUT / filename, format="PNG")
+    output_path = OUTPUT / filename
+
+    image.save(output_path, format="PNG")
+
+    logger.info("Rasm saqlandi: %s", output_path)
     return filename
 
 
-# Inline meme search
+# INLINE SEARCH
 async def inline_search(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    query = update.inline_query.query.strip()
+    inline_query = update.inline_query
+
+    if inline_query is None:
+        return
+
+    query = inline_query.query.strip()
     logger.info("INLINE QUERY RECEIVED: %r", query)
 
     if not query:
-        await update.inline_query.answer([], cache_time=0)
+        await inline_query.answer([], cache_time=0)
         return
 
     files = sorted(
         p for p in TEMPLATES.iterdir()
         if p.is_file()
         and p.suffix.lower() in ALLOWED_EXTENSIONS
-    )[:10]
+    )[:3]
 
     logger.info("Found %d template images", len(files))
 
+    if not files:
+        logger.error("templates papkasida rasm topilmadi")
+        await inline_query.answer([], cache_time=0)
+        return
+
+    # Telegram kutib qolmasligi uchun rasmlarni alohida
+    # thread'da tayyorlaymiz; har bir bosqich log qilinadi.
     results = []
 
     for index, source in enumerate(files, start=1):
         try:
-            filename = make_meme(source, query)
+            logger.info("Rasm tayyorlash boshlandi: %s", source.name)
+
+            filename = await asyncio.wait_for(
+                asyncio.to_thread(make_meme, source, query),
+                timeout=15,
+            )
+
+            logger.info("Rasm tayyorlandi: %s", filename)
+
             url = f"{BASE_URL}/img/{filename}"
+            logger.info("Rasm URL tayyorlandi: %s", url)
 
             results.append(
                 InlineQueryResultPhoto(
@@ -167,24 +194,37 @@ async def inline_search(
                     photo_url=url,
                     thumbnail_url=url,
                     title=f"Meme {index}",
-                    description=f"Shablon {index}",
+                    description=f"Matn: {query[:100]}",
                 )
             )
+
+        except asyncio.TimeoutError:
+            logger.error(
+                "Rasm tayyorlash 15 soniyada tugamadi: %s",
+                source.name,
+            )
+
         except Exception:
             logger.exception(
-                "Meme yaratishda xato: %s", source.name
+                "Failed to create meme from %s", source.name
             )
 
     logger.info("Sending %d inline results", len(results))
 
-    await update.inline_query.answer(
-        results,
-        cache_time=0,
-        is_personal=True,
-    )
+    # Javobni Telegram'ga yuborish
+    try:
+        await inline_query.answer(
+            results,
+            cache_time=0,
+            is_personal=True,
+        )
+        logger.info("INLINE JAVOB TELEGRAMGA YUBORILDI")
+
+    except Exception:
+        logger.exception("INLINE JAVOB YUBORISHDA XATO")
 
 
-# Error logging
+# ERROR HANDLER
 async def on_error(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
@@ -192,6 +232,7 @@ async def on_error(
     logger.error("Telegram bot error", exc_info=context.error)
 
 
+# WEB SERVER
 def run_web():
     web.run(
         host="0.0.0.0",
@@ -200,6 +241,7 @@ def run_web():
     )
 
 
+# START BOT
 def main():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
