@@ -1,35 +1,42 @@
 import os
 import re
-import io
 import json
 import glob
+import time
 import base64
 import hashlib
+import asyncio
 import logging
 import threading
+import urllib.request
 from io import BytesIO
 from collections import OrderedDict
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from PIL import Image, ImageDraw, ImageFont
-from telegram import Update, InlineQueryResultPhoto
+from telegram import (
+    Update, InlineQueryResultPhoto, InlineQueryResultCachedPhoto,
+    InputMediaPhoto,
+)
+from telegram.error import RetryAfter
 from telegram.ext import (
     Application, CommandHandler, InlineQueryHandler, ContextTypes,
 )
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TOKEN", "")
-BASE_URL = os.environ.get("BASE_URL", "").strip().rstrip("/")
 PORT = int(os.environ.get("PORT", "8080"))
 
 TEMPLATES_DIR = "templates"
-MAX_TEMPLATES = 30       # Telegram bir javobda 50 tagacha ruxsat beradi
+STORAGE_FILE = "storage_chat.txt"
+MAX_TEMPLATES = 30
 IMG_WIDTH = 720
 JPEG_QUALITY = 85
 FONT_DIV = 14            # katta son = kichik font
 MAX_BLOCK = 0.35
-REQUIRE_DOT = True       # False qilsangiz nuqta kerak bo'lmaydi
-MAX_CACHE = 200          # xotirada saqlanadigan tayyor rasmlar soni
+REQUIRE_DOT = True       # False = nuqta kerak emas
+MAX_CACHE = 200
+WAIT_SECONDS = 8         # yuklash rejimida kutish
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -42,11 +49,35 @@ FONT_PATHS = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
 ]
 
-base_images = {}   # yo'l -> rasm
-PATHS = []         # tartibli yo'llar ro'yxati
+
+def detect_base_url():
+    for name in ("BASE_URL", "PUBLIC_URL", "RENDER_EXTERNAL_URL"):
+        v = os.environ.get(name, "").strip()
+        if v:
+            break
+    else:
+        v = ""
+        for name in ("RAILWAY_PUBLIC_DOMAIN", "KOYEB_PUBLIC_DOMAIN"):
+            d = os.environ.get(name, "").strip()
+            if d:
+                v = d
+                break
+    if v and not v.startswith("http"):
+        v = "https://" + v
+    return v.rstrip("/")
+
+
+BASE_URL = detect_base_url()
+URL_MODE = False          # start paytida tekshiriladi
+
+base_images = {}
+PATHS = []
 img_cache = OrderedDict()
 cache_lock = threading.Lock()
+file_ids = {}             # (indeks, matn) -> file_id (yuklash rejimi)
 
+
+# ---------- rasm yasash ----------
 
 @lru_cache(maxsize=64)
 def get_font(size):
@@ -161,7 +192,7 @@ def make_meme(template_path, top_text, bottom_text):
     return buf.getvalue()
 
 
-# ---------- matnni URL ichiga joylash ----------
+# ---------- URL rejimi: matnni URL ichiga joylash ----------
 
 def enc(top, bottom):
     raw = json.dumps([top, bottom], ensure_ascii=False,
@@ -189,8 +220,6 @@ def get_image(idx, tok):
             img_cache.popitem(last=False)
     return data
 
-
-# ---------- rasm beradigan kichik web-server ----------
 
 URL_RE = re.compile(r"/m/(\d+)/([A-Za-z0-9_-]+)\.jpg")
 
@@ -231,14 +260,122 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def start_web():
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    except OSError as e:
+        logging.warning("Web-server ochilmadi (port %s): %s", PORT, e)
+        return
     threading.Thread(target=server.serve_forever, daemon=True).start()
     logging.info("Web-server %s portda ishlayapti", PORT)
+
+
+def check_url():
+    """BASE_URL/health ochilsa URL rejimi yoqiladi, bo'lmasa yuklash rejimi."""
+    global URL_MODE
+    if not BASE_URL:
+        logging.info("REJIM: yuklash (BASE_URL topilmadi)")
+        return
+    last = None
+    for _ in range(6):
+        try:
+            req = urllib.request.Request(
+                BASE_URL + "/health", headers={"User-Agent": "memebot"}
+            )
+            with urllib.request.urlopen(req, timeout=8) as r:
+                if r.read(10).strip() == b"ok":
+                    URL_MODE = True
+                    logging.info("REJIM: URL (tez) -> %s", BASE_URL)
+                    return
+                last = "javob 'ok' emas"
+        except Exception as e:
+            last = e
+        time.sleep(5)
+    logging.warning("REJIM: yuklash. %s/health ochilmadi: %s", BASE_URL, last)
+
+
+# ---------- yuklash rejimi (zaxira) ----------
+
+def read_storage():
+    try:
+        with open(STORAGE_FILE) as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+async def delete_later(bot, chat_id, message_ids):
+    for mid in message_ids:
+        try:
+            await bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+
+
+async def upload_chunk(bot, storage_id, idxs, q, top, bottom):
+    datas = [make_meme(PATHS[i], top, bottom) for i in idxs]
+    tm = dict(read_timeout=40, write_timeout=40,
+              connect_timeout=20, pool_timeout=20)
+    msgs = None
+    for _ in range(3):
+        try:
+            if len(datas) == 1:
+                msgs = [await bot.send_photo(storage_id, datas[0], **tm)]
+            else:
+                media = [InputMediaPhoto(media=d) for d in datas]
+                msgs = await bot.send_media_group(storage_id, media, **tm)
+            break
+        except RetryAfter as e:
+            logging.info("Limit, %s soniya kutaman", e.retry_after)
+            await asyncio.sleep(e.retry_after + 1)
+        except Exception as e:
+            logging.warning("Yuborishda xato: %s", e)
+            await asyncio.sleep(1)
+    if not msgs:
+        return
+    for i, msg in zip(idxs, msgs):
+        file_ids[(i, q)] = msg.photo[-1].file_id
+    asyncio.create_task(
+        delete_later(bot, storage_id, [m.message_id for m in msgs])
+    )
+
+
+async def answer_upload_mode(context, iq, q, top, bottom):
+    storage_id = read_storage()
+    if storage_id is None:
+        logging.warning("Botga /start yozing (rasm saqlash chati yo'q)")
+        await iq.answer([], cache_time=0)
+        return
+    missing = [i for i in range(len(PATHS)) if (i, q) not in file_ids]
+    chunks = [missing[i:i + 10] for i in range(0, len(missing), 10)]
+    if chunks:
+        work = asyncio.gather(
+            *[upload_chunk(context.bot, storage_id, c, q, top, bottom)
+              for c in chunks],
+            return_exceptions=True,
+        )
+        try:
+            await asyncio.wait_for(asyncio.shield(work), timeout=WAIT_SECONDS)
+        except asyncio.TimeoutError:
+            logging.info("Vaqt tugadi, borini yuboraman")
+    results = []
+    for i in range(len(PATHS)):
+        fid = file_ids.get((i, q))
+        if fid:
+            rid = hashlib.md5(f"{i}{q}".encode()).hexdigest()
+            results.append(
+                InlineQueryResultCachedPhoto(id=rid, photo_file_id=fid)
+            )
+    await iq.answer(results, cache_time=0, is_personal=True)
 
 
 # ---------- Telegram ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        with open(STORAGE_FILE, "w") as f:
+            f.write(str(update.effective_chat.id))
+    except Exception as e:
+        logging.warning("Chat ID saqlanmadi: %s", e)
     await update.message.reply_text(
         "Tayyor! Istalgan chatda yozing:\n"
         "@denismembot tepa matn | pastki matn.\n"
@@ -247,10 +384,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logging.info("Inline so'rov keldi: %r",
-    update.inline_query.query)
     iq = update.inline_query
     q = iq.query.strip()
+    logging.info("Inline so'rov: %r (rejim: %s)", q,
+                 "URL" if URL_MODE else "yuklash")
     if REQUIRE_DOT:
         if not q.endswith("."):
             await iq.answer([], cache_time=0)
@@ -263,19 +400,22 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = q.split("|", 1)
     top = parts[0].strip()
     bottom = parts[1].strip() if len(parts) > 1 else ""
-    tok = enc(top, bottom)
 
-    results = []
-    for i, p in enumerate(PATHS):
-        url = f"{BASE_URL}/m/{i}/{tok}.jpg"
-        w, h = base_images[p].size
-        rid = hashlib.md5(f"{i}{q}".encode()).hexdigest()
-        results.append(InlineQueryResultPhoto(
-            id=rid, photo_url=url, thumbnail_url=url,
-            photo_width=w, photo_height=h,
-        ))
     try:
-        await iq.answer(results, cache_time=10, is_personal=True)
+        if URL_MODE:
+            tok = enc(top, bottom)
+            results = []
+            for i, p in enumerate(PATHS):
+                url = f"{BASE_URL}/m/{i}/{tok}.jpg"
+                w, h = base_images[p].size
+                rid = hashlib.md5(f"{i}{q}".encode()).hexdigest()
+                results.append(InlineQueryResultPhoto(
+                    id=rid, photo_url=url, thumbnail_url=url,
+                    photo_width=w, photo_height=h,
+                ))
+            await iq.answer(results, cache_time=10, is_personal=True)
+        else:
+            await answer_upload_mode(context, iq, q, top, bottom)
     except Exception as e:
         logging.warning("Javob berib bo'lmadi: %s", e)
 
@@ -283,17 +423,15 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN topilmadi! Sozlamalarga qo'shing.")
-    if not BASE_URL.startswith("http"):
-        raise SystemExit(
-            "BASE_URL topilmadi! Masalan: https://mening-botim.host.com"
-        )
     ensure_templates()
     preload_templates()
     start_web()
+    threading.Thread(target=check_url, daemon=True).start()
     app = (
         Application.builder()
         .token(TOKEN)
         .concurrent_updates(True)
+        .connection_pool_size(32)
         .read_timeout(30)
         .write_timeout(30)
         .connect_timeout(20)
