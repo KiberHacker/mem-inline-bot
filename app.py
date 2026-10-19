@@ -278,7 +278,8 @@ def main():
         save_channel,
     ))
     app.add_handler(InlineQueryHandler(inline_query))
-        if BASE_URL:
+
+    if BASE_URL:
         path = hashlib.sha256(TOKEN.encode()).hexdigest()[:32]
         logging.info("Webhook rejimi: %s", BASE_URL)
         app.run_webhook(
