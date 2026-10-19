@@ -32,7 +32,7 @@ STORAGE_FILE = "storage_chat.txt"
 MAX_TEMPLATES = 30
 IMG_WIDTH = 720
 JPEG_QUALITY = 85
-FONT_DIV = 14            # katta son = kichik font
+FONT_DIV = 18            # katta son = kichik font
 MAX_BLOCK = 0.35
 REQUIRE_DOT = True       # False = nuqta kerak emas
 MAX_CACHE = 200
