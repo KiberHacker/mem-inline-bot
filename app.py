@@ -19,10 +19,10 @@ BASE_URL = os.environ.get("BASE_URL", "").strip().rstrip("/")
 PORT = int(os.environ.get("PORT", "8080"))
 STORAGE_FILE = "storage_chat.txt"
 TEMPLATES_DIR = "templates"
-MAX_TEMPLATES = 10       # RAM kam bo'lsa 6-8 qiling
+MAX_TEMPLATES = 9       # RAM kam bo'lsa 6-8 qiling
 IMG_WIDTH = 700
-JPEG_QUALITY = 80
-FONT_DIV = 14            # katta son = kichik font
+JPEG_QUALITY = 800
+FONT_DIV = 18            # katta son = kichik font
 MAX_BLOCK = 0.35         # matn balandlikning ko'pi bilan 35% i
 WAIT_SECONDS = 8
 
