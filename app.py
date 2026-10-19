@@ -1,266 +1,282 @@
 import os
-import uuid
+import glob
+import hashlib
 import asyncio
-import threading
 import logging
-from pathlib import Path
+from io import BytesIO
+from functools import lru_cache
 
-from flask import Flask, send_from_directory, abort
 from PIL import Image, ImageDraw, ImageFont
-
-from telegram import Update, InlineQueryResultPhoto
+from telegram import Update, InlineQueryResultCachedPhoto, InputMediaPhoto
+from telegram.error import RetryAfter
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    InlineQueryHandler,
-    ContextTypes,
+    Application, CommandHandler, InlineQueryHandler,
+    MessageHandler, filters, ContextTypes,
 )
 
-# LOG SETTINGS
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    level=logging.INFO,
-)
+TOKEN = os.environ.get("BOT_TOKEN", "")
+STORAGE_FILE = "storage_chat.txt"
+TEMPLATES_DIR = "templates"
+MAX_TEMPLATES = 10       # RAM kam bo'lsa 6-8 qiling
+IMG_WIDTH = 700
+JPEG_QUALITY = 80
+FONT_DIV = 14            # katta son = kichik font
+MAX_BLOCK = 0.35         # matn balandlikning ko'pi bilan 35% i
+WAIT_SECONDS = 8
+
+logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logger = logging.getLogger("MemeBot")
 
-# RENDER ENVIRONMENT
-TOKEN = os.environ["BOT_TOKEN"]
-BASE_URL = os.environ["BASE_URL"].rstrip("/")
+FONT_PATHS = [
+    "font.ttf",
+    "/system/fonts/Roboto-Black.ttf",
+    "/system/fonts/Roboto-Bold.ttf",
+    "/system/fonts/DroidSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+]
 
-ROOT = Path(__file__).parent
-TEMPLATES = ROOT / "templates"
-OUTPUT = Path("/tmp/meme-output")
-
-TEMPLATES.mkdir(exist_ok=True)
-OUTPUT.mkdir(parents=True, exist_ok=True)
-
-ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
-
-web = Flask(__name__)
+cache = {}         # (shablon, matn) -> file_id
+base_images = {}   # shablon yo'li -> tayyor rasm
 
 
-@web.get("/")
-def home():
-    return "Meme bot is running!"
-
-
-@web.get("/img/<filename>")
-def get_image(filename):
-    if not filename.endswith(".png") or Path(filename).name != filename:
-        abort(404)
-
-    path = OUTPUT / filename
-    if not path.is_file():
-        abort(404)
-
-    return send_from_directory(OUTPUT, filename)
-
-
-# START COMMAND
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message:
-        await update.message.reply_text(
-            "Salom! 👋 Meme bot ishlayapti!\n\n"
-            "Istalgan chatda quyidagicha yozing:\n"
-            "@denismembot salom\n\n"
-            "So'ng chiqqan memlardan birini tanlang."
-        )
-
-
-# CREATE MEME IMAGE
-def make_meme(source, text):
-    logger.info("Rasm ochilmoqda: %s", source.name)
-
-    with Image.open(source) as original:
-        image = original.convert("RGB")
-
-    draw = ImageDraw.Draw(image)
-
-    font_path = (
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-    )
-    size = max(18, image.width // 12)
-
+@lru_cache(maxsize=64)
+def get_font(size):
+    for path in FONT_PATHS:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size)
     try:
-        font = ImageFont.truetype(font_path, size)
-    except OSError:
-        font = ImageFont.load_default()
+        return ImageFont.load_default(size)
+    except TypeError:
+        return ImageFont.load_default()
 
-    # Matnni qatorlarga ajratish
-    lines = []
-    current = ""
 
-    for word in text.split():
-        candidate = f"{current} {word}".strip()
-        box = draw.textbbox((0, 0), candidate, font=font)
+def get_templates():
+    files = []
+    for ext in ("jpg", "jpeg", "png", "JPG", "JPEG", "PNG"):
+        files += glob.glob(f"{TEMPLATES_DIR}/*.{ext}")
+    return sorted(set(files))[:MAX_TEMPLATES]
 
-        if box[2] - box[0] <= image.width * 0.9:
-            current = candidate
+
+def ensure_templates():
+    os.makedirs(TEMPLATES_DIR, exist_ok=True)
+    if not get_templates():
+        colors = [(40, 40, 160), (160, 40, 40), (40, 130, 60)]
+        for i, c in enumerate(colors, 1):
+            Image.new("RGB", (600, 600), c).save(f"{TEMPLATES_DIR}/rang{i}.jpg")
+
+
+def preload_templates():
+    for path in get_templates():
+        try:
+            img = Image.open(path).convert("RGB")
+        except Exception as e:
+            logging.warning("Rasm ochilmadi %s: %s", path, e)
+            continue
+        if img.width > IMG_WIDTH:
+            ratio = IMG_WIDTH / img.width
+            img = img.resize((IMG_WIDTH, int(img.height * ratio)))
+        base_images[path] = img
+    logging.info("Yuklangan shablonlar: %d ta", len(base_images))
+
+
+def split_word(draw, word, font, max_w):
+    parts, cur = [], ""
+    for ch in word:
+        if draw.textlength(cur + ch, font=font) <= max_w:
+            cur += ch
         else:
-            if current:
-                lines.append(current)
-            current = word
+            parts.append(cur)
+            cur = ch
+    parts.append(cur)
+    return parts
 
-    if current:
-        lines.append(current)
 
-    if not lines:
-        lines = [text]
+def wrap(draw, text, font, max_w):
+    lines, line = [], ""
+    for word in text.split():
+        if draw.textlength(word, font=font) > max_w:
+            if line:
+                lines.append(line)
+                line = ""
+            parts = split_word(draw, word, font, max_w)
+            lines.extend(parts[:-1])
+            line = parts[-1]
+            continue
+        test = f"{line} {word}".strip()
+        if draw.textlength(test, font=font) <= max_w:
+            line = test
+        else:
+            lines.append(line)
+            line = word
+    if line:
+        lines.append(line)
+    return lines
 
-    line_height = size + 8
-    max_lines = max(1, (image.height - 20) // line_height)
+
+def draw_block(draw, text, W, H, top):
+    text = text.upper()
+    max_h = int(H * MAX_BLOCK)
+    size = max(10, W // FONT_DIV)
+    while True:
+        font = get_font(size)
+        stroke = max(1, size // 14)
+        lines = wrap(draw, text, font, W - 24 - 2 * stroke)
+        line_h = int(size * 1.15)
+        if len(lines) * line_h <= max_h or size <= 9:
+            break
+        size -= 1
+
+    max_lines = max(1, max_h // line_h)
     lines = lines[:max_lines]
 
-    y = max(5, image.height - len(lines) * line_height - 20)
-
-    for line in lines:
-        box = draw.textbbox(
-            (0, 0), line, font=font, stroke_width=3
-        )
-        text_width = box[2] - box[0]
-        x = max(5, (image.width - text_width) // 2)
-
+    total = len(lines) * line_h
+    y = 6 if top else H - total - 6
+    for ln in lines:
         draw.text(
-            (x, y),
-            line,
-            font=font,
-            fill="white",
-            stroke_width=3,
-            stroke_fill="black",
+            (W / 2, y + stroke), ln, font=font, fill="white",
+            stroke_width=stroke, stroke_fill="black", anchor="mt",
         )
-        y += line_height
-
-    filename = f"{uuid.uuid4().hex}.png"
-    output_path = OUTPUT / filename
-
-    image.save(output_path, format="PNG")
-
-    logger.info("Rasm saqlandi: %s", output_path)
-    return filename
+        y += line_h
 
 
-# INLINE SEARCH
-async def inline_search(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    inline_query = update.inline_query
-
-    if inline_query is None:
-        return
-
-    query = inline_query.query.strip()
-    logger.info("INLINE QUERY RECEIVED: %r", query)
-
-    if not query:
-        await inline_query.answer([], cache_time=0)
-        return
-
-    files = sorted(
-        p for p in TEMPLATES.iterdir()
-        if p.is_file()
-        and p.suffix.lower() in ALLOWED_EXTENSIONS
-    )[:3]
-
-    logger.info("Found %d template images", len(files))
-
-    if not files:
-        logger.error("templates papkasida rasm topilmadi")
-        await inline_query.answer([], cache_time=0)
-        return
-
-    # Telegram kutib qolmasligi uchun rasmlarni alohida
-    # thread'da tayyorlaymiz; har bir bosqich log qilinadi.
-    results = []
-
-    for index, source in enumerate(files, start=1):
-        try:
-            logger.info("Rasm tayyorlash boshlandi: %s", source.name)
-
-            filename = await asyncio.wait_for(
-                asyncio.to_thread(make_meme, source, query),
-                timeout=15,
-            )
-
-            logger.info("Rasm tayyorlandi: %s", filename)
-
-            url = f"{BASE_URL}/img/{filename}"
-            logger.info("Rasm URL tayyorlandi: %s", url)
-
-            results.append(
-                InlineQueryResultPhoto(
-                    id=uuid.uuid4().hex,
-                    photo_url=url,
-                    thumbnail_url=url,
-                    title=f"Meme {index}",
-                    description=f"Matn: {query[:100]}",
-                )
-            )
-
-        except asyncio.TimeoutError:
-            logger.error(
-                "Rasm tayyorlash 15 soniyada tugamadi: %s",
-                source.name,
-            )
-
-        except Exception:
-            logger.exception(
-                "Failed to create meme from %s", source.name
-            )
-
-    logger.info("Sending %d inline results", len(results))
-
-    # Javobni Telegram'ga yuborish
-    try:
-        await inline_query.answer(
-            results,
-            cache_time=0,
-            is_personal=True,
-        )
-        logger.info("INLINE JAVOB TELEGRAMGA YUBORILDI")
-
-    except Exception:
-        logger.exception("INLINE JAVOB YUBORISHDA XATO")
+def make_meme(template_path, top_text, bottom_text):
+    img = base_images[template_path].copy()
+    draw = ImageDraw.Draw(img)
+    if top_text:
+        draw_block(draw, top_text, img.width, img.height, top=True)
+    if bottom_text:
+        draw_block(draw, bottom_text, img.width, img.height, top=False)
+    buf = BytesIO()
+    img.save(buf, "JPEG", quality=JPEG_QUALITY)
+    return buf.getvalue()
 
 
-# ERROR HANDLER
-async def on_error(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    logger.error("Telegram bot error", exc_info=context.error)
-
-
-# WEB SERVER
-def run_web():
-    web.run(
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", "10000")),
-        use_reloader=False,
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with open(STORAGE_FILE, "w") as f:
+        f.write(str(update.effective_chat.id))
+    await update.message.reply_text(
+        "Tayyor! Endi istalgan chatda yozing:\n"
+        "@denismembot tepa matn | pastki matn.\n"
+        "Oxiriga nuqta (.) qo'yishni unutmang."
     )
 
 
-# START BOT
+async def save_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.channel_post.chat.id
+    with open(STORAGE_FILE, "w") as f:
+        f.write(str(chat_id))
+    await context.bot.send_message(chat_id, "Saqlandi ✅")
+
+
+async def delete_later(bot, chat_id, message_ids):
+    for mid in message_ids:
+        try:
+            await bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+
+
+async def upload_chunk(bot, storage_id, chunk, q, top, bottom):
+    datas = [make_meme(p, top, bottom) for p in chunk]
+    tm = dict(read_timeout=40, write_timeout=40,
+              connect_timeout=20, pool_timeout=20)
+    msgs = None
+    for _ in range(3):
+        try:
+            if len(datas) == 1:
+                m = await bot.send_photo(storage_id, datas[0], **tm)
+                msgs = [m]
+            else:
+                media = [InputMediaPhoto(media=d) for d in datas]
+                msgs = await bot.send_media_group(storage_id, media, **tm)
+            break
+        except RetryAfter as e:
+            logging.info("Limit, %s soniya kutaman", e.retry_after)
+            await asyncio.sleep(e.retry_after + 1)
+        except Exception as e:
+            logging.warning("Yuborishda xato: %s", e)
+            await asyncio.sleep(1)
+    if not msgs:
+        return
+    for path, msg in zip(chunk, msgs):
+        cache[(path, q)] = msg.photo[-1].file_id
+    asyncio.create_task(
+        delete_later(bot, storage_id, [m.message_id for m in msgs])
+    )
+
+
+async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    iq = update.inline_query
+    q = iq.query.strip()
+    if not q.endswith(".") or not os.path.exists(STORAGE_FILE):
+        await iq.answer([], cache_time=0)
+        return
+    q = q[:-1].strip()
+    if not q:
+        await iq.answer([], cache_time=0)
+        return
+
+    with open(STORAGE_FILE) as f:
+        storage_id = int(f.read().strip())
+
+    parts = q.split("|", 1)
+    top = parts[0].strip()
+    bottom = parts[1].strip() if len(parts) > 1 else ""
+
+    paths = list(base_images)
+    missing = [p for p in paths if (p, q) not in cache]
+
+    chunks = [missing[i:i + 10] for i in range(0, len(missing), 10)]
+    if chunks:
+        work = asyncio.gather(
+            *[upload_chunk(context.bot, storage_id, c, q, top, bottom)
+              for c in chunks],
+            return_exceptions=True,
+        )
+        try:
+            await asyncio.wait_for(asyncio.shield(work), timeout=WAIT_SECONDS)
+        except asyncio.TimeoutError:
+            logging.info("Vaqt tugadi, borini yuboraman")
+
+    results = []
+    for p in paths:
+        file_id = cache.get((p, q))
+        if not file_id:
+            continue
+        rid = hashlib.md5(f"{p}{q}".encode()).hexdigest()
+        results.append(InlineQueryResultCachedPhoto(id=rid, photo_file_id=file_id))
+
+    try:
+        await iq.answer(results, cache_time=0, is_personal=True)
+    except Exception as e:
+        logging.warning("Javob berib bo'lmadi: %s", e)
+
+
 def main():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    threading.Thread(
-        target=run_web,
-        daemon=True,
-        name="web-server",
-    ).start()
-
-    bot = Application.builder().token(TOKEN).build()
-
-    bot.add_handler(CommandHandler("start", start))
-    bot.add_handler(InlineQueryHandler(inline_search))
-    bot.add_error_handler(on_error)
-
-    logger.info("Meme bot starting...")
-
-    bot.run_polling(drop_pending_updates=False)
+    if not TOKEN:
+        raise SystemExit(
+            "BOT_TOKEN topilmadi! Server sozlamalariga BOT_TOKEN ni qo'shing."
+        )
+    ensure_templates()
+    preload_templates()
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .concurrent_updates(True)
+        .connection_pool_size(32)
+        .read_timeout(30)
+        .write_timeout(30)
+        .connect_timeout(20)
+        .pool_timeout(20)
+        .build()
+    )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(
+        filters.UpdateType.CHANNEL_POSTS & filters.Regex(r"^/start"),
+        save_channel,
+    ))
+    app.add_handler(InlineQueryHandler(inline_query))
+    app.run_polling()
 
 
 if __name__ == "__main__":
