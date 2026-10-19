@@ -1,30 +1,35 @@
 import os
+import re
+import io
+import json
 import glob
+import base64
 import hashlib
-import asyncio
 import logging
+import threading
 from io import BytesIO
+from collections import OrderedDict
 from functools import lru_cache
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from PIL import Image, ImageDraw, ImageFont
-from telegram import Update, InlineQueryResultCachedPhoto, InputMediaPhoto
-from telegram.error import RetryAfter
+from telegram import Update, InlineQueryResultPhoto
 from telegram.ext import (
-    Application, CommandHandler, InlineQueryHandler,
-    MessageHandler, filters, ContextTypes,
+    Application, CommandHandler, InlineQueryHandler, ContextTypes,
 )
 
 TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TOKEN", "")
 BASE_URL = os.environ.get("BASE_URL", "").strip().rstrip("/")
 PORT = int(os.environ.get("PORT", "8080"))
-STORAGE_FILE = "storage_chat.txt"
+
 TEMPLATES_DIR = "templates"
-MAX_TEMPLATES = 9       # RAM kam bo'lsa 6-8 qiling
-IMG_WIDTH = 700
-JPEG_QUALITY = 800
-FONT_DIV = 18            # katta son = kichik font
-MAX_BLOCK = 0.35         # matn balandlikning ko'pi bilan 35% i
-WAIT_SECONDS = 8
+MAX_TEMPLATES = 30       # Telegram bir javobda 50 tagacha ruxsat beradi
+IMG_WIDTH = 720
+JPEG_QUALITY = 85
+FONT_DIV = 18           # katta son = kichik font
+MAX_BLOCK = 0.35
+REQUIRE_DOT = True       # False qilsangiz nuqta kerak bo'lmaydi
+MAX_CACHE = 200          # xotirada saqlanadigan tayyor rasmlar soni
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -37,8 +42,10 @@ FONT_PATHS = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
 ]
 
-cache = {}         # (shablon, matn) -> file_id
-base_images = {}   # shablon yo'li -> tayyor rasm
+base_images = {}   # yo'l -> rasm
+PATHS = []         # tartibli yo'llar ro'yxati
+img_cache = OrderedDict()
+cache_lock = threading.Lock()
 
 
 @lru_cache(maxsize=64)
@@ -64,7 +71,7 @@ def ensure_templates():
     if not get_templates():
         colors = [(40, 40, 160), (160, 40, 40), (40, 130, 60)]
         for i, c in enumerate(colors, 1):
-            Image.new("RGB", (600, 600), c).save(f"{TEMPLATES_DIR}/rang{i}.jpg")
+            Image.new("RGB", (720, 720), c).save(f"{TEMPLATES_DIR}/rang{i}.jpg")
 
 
 def preload_templates():
@@ -74,11 +81,12 @@ def preload_templates():
         except Exception as e:
             logging.warning("Rasm ochilmadi %s: %s", path, e)
             continue
-        if img.width > IMG_WIDTH:
+        if img.width != IMG_WIDTH:
             ratio = IMG_WIDTH / img.width
             img = img.resize((IMG_WIDTH, int(img.height * ratio)))
         base_images[path] = img
-    logging.info("Yuklangan shablonlar: %d ta", len(base_images))
+    PATHS[:] = list(base_images)
+    logging.info("Yuklangan shablonlar: %d ta", len(PATHS))
 
 
 def split_word(draw, word, font, max_w):
@@ -153,119 +161,137 @@ def make_meme(template_path, top_text, bottom_text):
     return buf.getvalue()
 
 
+# ---------- matnni URL ichiga joylash ----------
+
+def enc(top, bottom):
+    raw = json.dumps([top, bottom], ensure_ascii=False,
+                     separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def dec(tok):
+    tok += "=" * (-len(tok) % 4)
+    top, bottom = json.loads(base64.urlsafe_b64decode(tok).decode())
+    return str(top), str(bottom)
+
+
+def get_image(idx, tok):
+    key = (idx, tok)
+    with cache_lock:
+        if key in img_cache:
+            img_cache.move_to_end(key)
+            return img_cache[key]
+    top, bottom = dec(tok)
+    data = make_meme(PATHS[idx], top, bottom)
+    with cache_lock:
+        img_cache[key] = data
+        while len(img_cache) > MAX_CACHE:
+            img_cache.popitem(last=False)
+    return data
+
+
+# ---------- rasm beradigan kichik web-server ----------
+
+URL_RE = re.compile(r"/m/(\d+)/([A-Za-z0-9_-]+)\.jpg")
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _serve(self, head):
+        path = self.path.split("?", 1)[0]
+        ctype = "image/jpeg"
+        if path in ("/", "/health"):
+            body, ctype = b"ok", "text/plain"
+        else:
+            m = URL_RE.fullmatch(path)
+            if not m or int(m.group(1)) >= len(PATHS):
+                self.send_error(404)
+                return
+            try:
+                body = get_image(int(m.group(1)), m.group(2))
+            except Exception as e:
+                logging.warning("Rasm yasashda xato: %s", e)
+                self.send_error(400)
+                return
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        if not head:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        self._serve(False)
+
+    def do_HEAD(self):
+        self._serve(True)
+
+    def log_message(self, *args):
+        pass
+
+
+def start_web():
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    logging.info("Web-server %s portda ishlayapti", PORT)
+
+
+# ---------- Telegram ----------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with open(STORAGE_FILE, "w") as f:
-        f.write(str(update.effective_chat.id))
     await update.message.reply_text(
-        "Tayyor! Endi istalgan chatda yozing:\n"
+        "Tayyor! Istalgan chatda yozing:\n"
         "@denismembot tepa matn | pastki matn.\n"
         "Oxiriga nuqta (.) qo'yishni unutmang."
-    )
-
-
-async def save_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.channel_post.chat.id
-    with open(STORAGE_FILE, "w") as f:
-        f.write(str(chat_id))
-    await context.bot.send_message(chat_id, "Saqlandi ✅")
-
-
-async def delete_later(bot, chat_id, message_ids):
-    for mid in message_ids:
-        try:
-            await bot.delete_message(chat_id, mid)
-        except Exception:
-            pass
-
-
-async def upload_chunk(bot, storage_id, chunk, q, top, bottom):
-    datas = [make_meme(p, top, bottom) for p in chunk]
-    tm = dict(read_timeout=40, write_timeout=40,
-              connect_timeout=20, pool_timeout=20)
-    msgs = None
-    for _ in range(3):
-        try:
-            if len(datas) == 1:
-                m = await bot.send_photo(storage_id, datas[0], **tm)
-                msgs = [m]
-            else:
-                media = [InputMediaPhoto(media=d) for d in datas]
-                msgs = await bot.send_media_group(storage_id, media, **tm)
-            break
-        except RetryAfter as e:
-            logging.info("Limit, %s soniya kutaman", e.retry_after)
-            await asyncio.sleep(e.retry_after + 1)
-        except Exception as e:
-            logging.warning("Yuborishda xato: %s", e)
-            await asyncio.sleep(1)
-    if not msgs:
-        return
-    for path, msg in zip(chunk, msgs):
-        cache[(path, q)] = msg.photo[-1].file_id
-    asyncio.create_task(
-        delete_later(bot, storage_id, [m.message_id for m in msgs])
     )
 
 
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     iq = update.inline_query
     q = iq.query.strip()
-    if not q.endswith(".") or not os.path.exists(STORAGE_FILE):
-        await iq.answer([], cache_time=0)
-        return
-    q = q[:-1].strip()
+    if REQUIRE_DOT:
+        if not q.endswith("."):
+            await iq.answer([], cache_time=0)
+            return
+        q = q[:-1].strip()
     if not q:
         await iq.answer([], cache_time=0)
         return
 
-    with open(STORAGE_FILE) as f:
-        storage_id = int(f.read().strip())
-
     parts = q.split("|", 1)
     top = parts[0].strip()
     bottom = parts[1].strip() if len(parts) > 1 else ""
-
-    paths = list(base_images)
-    missing = [p for p in paths if (p, q) not in cache]
-
-    chunks = [missing[i:i + 10] for i in range(0, len(missing), 10)]
-    if chunks:
-        work = asyncio.gather(
-            *[upload_chunk(context.bot, storage_id, c, q, top, bottom)
-              for c in chunks],
-            return_exceptions=True,
-        )
-        try:
-            await asyncio.wait_for(asyncio.shield(work), timeout=WAIT_SECONDS)
-        except asyncio.TimeoutError:
-            logging.info("Vaqt tugadi, borini yuboraman")
+    tok = enc(top, bottom)
 
     results = []
-    for p in paths:
-        file_id = cache.get((p, q))
-        if not file_id:
-            continue
-        rid = hashlib.md5(f"{p}{q}".encode()).hexdigest()
-        results.append(InlineQueryResultCachedPhoto(id=rid, photo_file_id=file_id))
-
+    for i, p in enumerate(PATHS):
+        url = f"{BASE_URL}/m/{i}/{tok}.jpg"
+        w, h = base_images[p].size
+        rid = hashlib.md5(f"{i}{q}".encode()).hexdigest()
+        results.append(InlineQueryResultPhoto(
+            id=rid, photo_url=url, thumbnail_url=url,
+            photo_width=w, photo_height=h,
+        ))
     try:
-        await iq.answer(results, cache_time=0, is_personal=True)
+        await iq.answer(results, cache_time=10, is_personal=True)
     except Exception as e:
         logging.warning("Javob berib bo'lmadi: %s", e)
 
 
 def main():
     if not TOKEN:
+        raise SystemExit("BOT_TOKEN topilmadi! Sozlamalarga qo'shing.")
+    if not BASE_URL.startswith("http"):
         raise SystemExit(
-            "BOT_TOKEN topilmadi! Server sozlamalariga BOT_TOKEN ni qo'shing."
+            "BASE_URL topilmadi! Masalan: https://mening-botim.host.com"
         )
     ensure_templates()
     preload_templates()
+    start_web()
     app = (
         Application.builder()
         .token(TOKEN)
         .concurrent_updates(True)
-        .connection_pool_size(32)
         .read_timeout(30)
         .write_timeout(30)
         .connect_timeout(20)
@@ -273,25 +299,8 @@ def main():
         .build()
     )
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(
-        filters.UpdateType.CHANNEL_POSTS & filters.Regex(r"^/start"),
-        save_channel,
-    ))
     app.add_handler(InlineQueryHandler(inline_query))
-
-    if BASE_URL:
-        path = hashlib.sha256(TOKEN.encode()).hexdigest()[:32]
-        logging.info("Webhook rejimi: %s", BASE_URL)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=path,
-            webhook_url=f"{BASE_URL}/{path}",
-            drop_pending_updates=True,
-        )
-    else:
-        logging.info("Polling rejimi")
-        app.run_polling()
+    app.run_polling()
 
 
 if __name__ == "__main__":
