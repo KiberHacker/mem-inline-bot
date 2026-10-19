@@ -14,7 +14,9 @@ from telegram.ext import (
     MessageHandler, filters, ContextTypes,
 )
 
-TOKEN = os.environ.get("BOT_TOKEN", "")
+TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TOKEN", "")
+BASE_URL = os.environ.get("BASE_URL", "").strip().rstrip("/")
+PORT = int(os.environ.get("PORT", "8080"))
 STORAGE_FILE = "storage_chat.txt"
 TEMPLATES_DIR = "templates"
 MAX_TEMPLATES = 10       # RAM kam bo'lsa 6-8 qiling
@@ -276,7 +278,19 @@ def main():
         save_channel,
     ))
     app.add_handler(InlineQueryHandler(inline_query))
-    app.run_polling()
+        if BASE_URL:
+        path = hashlib.sha256(TOKEN.encode()).hexdigest()[:32]
+        logging.info("Webhook rejimi: %s", BASE_URL)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=path,
+            webhook_url=f"{BASE_URL}/{path}",
+            drop_pending_updates=True,
+        )
+    else:
+        logging.info("Polling rejimi")
+        app.run_polling()
 
 
 if __name__ == "__main__":
