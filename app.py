@@ -247,6 +247,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Inline so'rov keldi: %r",
+    update.inline_query.query)
     iq = update.inline_query
     q = iq.query.strip()
     if REQUIRE_DOT:
