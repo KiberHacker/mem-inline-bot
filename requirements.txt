@@ -1,4 +1,2 @@
-python-telegram-bot==21.10
-Pillow
-Flask
-
+python-telegram-bot
+pillow
