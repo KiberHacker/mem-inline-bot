@@ -18,7 +18,7 @@ from telegram.ext import (
     Application, CommandHandler, InlineQueryHandler, ContextTypes,
 )
 
-TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TOKEN", "")
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TOKEN", "")
 BASE_URL = os.environ.get("BASE_URL", "").strip().rstrip("/")
 PORT = int(os.environ.get("PORT", "8080"))
 
@@ -26,7 +26,7 @@ TEMPLATES_DIR = "templates"
 MAX_TEMPLATES = 30       # Telegram bir javobda 50 tagacha ruxsat beradi
 IMG_WIDTH = 720
 JPEG_QUALITY = 85
-FONT_DIV = 18           # katta son = kichik font
+FONT_DIV = 14            # katta son = kichik font
 MAX_BLOCK = 0.35
 REQUIRE_DOT = True       # False qilsangiz nuqta kerak bo'lmaydi
 MAX_CACHE = 200          # xotirada saqlanadigan tayyor rasmlar soni
@@ -280,7 +280,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not TOKEN:
-        raise SystemExit("BOT_TOKEN topilmadi! Sozlamalarga qo'shing.")
+        raise SystemExit("TELEGRAM_BOT_TOKEN topilmadi! Sozlamalarga qo'shing.")
     if not BASE_URL.startswith("http"):
         raise SystemExit(
             "BASE_URL topilmadi! Masalan: https://mening-botim.host.com"
